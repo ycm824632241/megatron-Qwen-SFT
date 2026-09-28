@@ -1,0 +1,14 @@
+{
+  "out": "/kwkj-k8s/llm_team/ycm/megatron_qwen35/data/swe_live_glm53.jsonl",
+  "gen_dir": "/kwkj-k8s/llm_team/ycm/Datasets-coding/SWE-bench-Live/logs/glm53_lite_v2/gen",
+  "n_traj_files": 176,
+  "kept_traj": 60,
+  "skipped_filter": 116,
+  "skipped_no_assistant": 0,
+  "skipped_greeting": 0,
+  "skipped_no_tool_call": 0,
+  "n_samples": 3382,
+  "keep_turns": "skip_greeting",
+  "include_failed": false,
+  "n_samples_written": 3382
+}

@@ -1,0 +1,13 @@
+{
+  "dst": "/kwkj-k8s/llm_team/ycm/megatron_qwen35/data/LiveCodeBench.jsonl",
+  "n": 2073,
+  "scanned_pass_lines": 2074,
+  "target": 5000,
+  "reached_target": false,
+  "sources": [
+    "/kwkj-k8s/llm_team/ycm/Datasets-coding/LiveCodeBench/output/GLM5.3/Scenario.codegeneration_1_0.2_sft_pass.jsonl",
+    "/kwkj-k8s/llm_team/ycm/Datasets-coding/LiveCodeBench/output/GLM5.3/Scenario.codegeneration_1_0.4_sft_pass.jsonl",
+    "/kwkj-k8s/llm_team/ycm/Datasets-coding/LiveCodeBench/output/GLM5.3/Scenario.codegeneration_1_0.6_sft_pass.jsonl",
+    "/kwkj-k8s/llm_team/ycm/Datasets-coding/LiveCodeBench/output/GLM5.3/Scenario.codegeneration_1_0.8_sft_pass.jsonl"
+  ]
+}

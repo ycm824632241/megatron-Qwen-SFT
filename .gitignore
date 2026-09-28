@@ -1,0 +1,35 @@
+# Environments / caches
+.venv/
+.uv-cache/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.ruff_cache/
+
+# Large artifacts (not tracked; see README). Anchored to repo root so that
+# same-named source dirs inside Megatron-Bridge/ (e.g. src/.../models/) stay tracked.
+/models/
+/wheels/
+*.whl
+/downloads/
+/data/*.jsonl
+/data/*/
+/trajectory_archive_*/*.tar.zst
+
+# Build outputs (e.g. Megatron dataset helpers compiled by setup_uv_env.sh)
+*.so
+
+# qwen35_lora runtime outputs
+/qwen35_lora/data/
+/qwen35_lora/checkpoints/
+/qwen35_lora/export/
+/qwen35_lora/logs/
+/qwen35_lora/.cache/
+
+# Model weights
+*.safetensors
+*.bin
+*.pt
+*.pth
+*.distcp

@@ -1,0 +1,243 @@
+diff --git a/megatron/core/datasets/Makefile b/megatron/core/datasets/Makefile
+index 16f251b..f03ad5e 100644
+--- a/megatron/core/datasets/Makefile
++++ b/megatron/core/datasets/Makefile
+@@ -1,8 +1,9 @@
+ CXXFLAGS += -O3 -Wall -shared -std=c++17 -fPIC -fdiagnostics-color
+-CPPFLAGS += $(shell python3 -m pybind11 --includes)
++PYTHON ?= python3
++CPPFLAGS += $(shell $(PYTHON) -m pybind11 --includes)
+ 
+ LIBNAME = helpers_cpp
+-LIBEXT = $(shell python3-config --extension-suffix)
++LIBEXT = $(shell $(PYTHON)-config --extension-suffix 2>/dev/null || $(PYTHON) -c 'import sysconfig; print(sysconfig.get_config_var("EXT_SUFFIX"))')
+ 
+ OUT = $(LIBNAME)$(LIBEXT)
+ SRC = helpers.cpp
+diff --git a/megatron/core/ssm/gated_delta_net/common.py b/megatron/core/ssm/gated_delta_net/common.py
+index 7ddaf6c..d9c3b9f 100644
+--- a/megatron/core/ssm/gated_delta_net/common.py
++++ b/megatron/core/ssm/gated_delta_net/common.py
+@@ -448,14 +448,48 @@ class _GDNBase(MegatronModule):
+     def _resolve_cu_seqlens(
+         self, cu_seqlens_padded, cu_seqlens_actual, total_seq_len, name, cp_size: int = 1
+     ) -> torch.Tensor:
+-        """Resolve cu_seqlens for packed sequence all-to-all, handling alignment padding."""
+-        if cu_seqlens_padded is not None:
+-            cu_seqlens = cu_seqlens_padded
++        """Resolve cu_seqlens for packed sequence kernels, handling alignment padding.
++
++        Prefer logical (actual) boundaries when present so EOS pad-tails and
++        alignment pads are not run through FLA/causal_conv1d. Callers that need
++        ``cu[-1] == total_seq_len`` for TE should use padded separately.
++        """
++
++        def _strip(cu: torch.Tensor) -> torch.Tensor:
++            if not isinstance(cu, torch.Tensor) or cu.numel() < 2:
++                return cu
++            end = int(cu.numel())
++            while end > 1 and int(cu[end - 1].item()) == int(cu[end - 2].item()):
++                end -= 1
++            return cu[:end].contiguous() if end != int(cu.numel()) else cu
++
++        actual = _strip(cu_seqlens_actual) if cu_seqlens_actual is not None else None
++        padded = _strip(cu_seqlens_padded) if cu_seqlens_padded is not None else None
++
++        # CP>1 needs physical alignment lengths; CP=1 prefers logical content.
++        if cp_size > 1 and padded is not None:
++            cu_seqlens = padded
++        elif actual is not None:
++            cu_seqlens = actual
+         else:
+-            cu_seqlens = cu_seqlens_actual
++            cu_seqlens = padded
+ 
+-        total_cu = cu_seqlens[-1].cpu().item()
+-        if total_cu != total_seq_len:
++        total_cu = int(cu_seqlens[-1].cpu().item())
++        if total_cu > total_seq_len:
++            raise ValueError(
++                f"GDN: {name}[-1]={total_cu} exceeds "
++                f"total_sequence_length={total_seq_len}. "
++                f"({cu_seqlens_padded=}, {cu_seqlens_actual=})."
++            )
++        # Allow logical cu shorter than the tensor (EOS pad-tail retained for TE).
++        if total_cu != total_seq_len and padded is not None:
++            pad_total = int(padded[-1].cpu().item())
++            if pad_total != total_seq_len:
++                raise ValueError(
++                    f"GDN: padded {name}[-1]={pad_total} does not match "
++                    f"total_sequence_length={total_seq_len}."
++                )
++        elif total_cu != total_seq_len:
+             raise ValueError(
+                 f"GDN: {name}[-1]={total_cu} does not match "
+                 f"total_sequence_length={total_seq_len}. "
+@@ -468,6 +502,11 @@ class _GDNBase(MegatronModule):
+                 f"All per-sequence lengths in cu_seqlens must be divisible by cp_size={cp_size}, "
+                 f"but got lengths: {seq_lengths.tolist()}"
+             )
++        if (seq_lengths <= 0).any():
++            raise ValueError(
++                f"GDN: {name} contains non-positive sequence lengths after trim: "
++                f"{seq_lengths.tolist()}"
++            )
+ 
+         return cu_seqlens
+ 
+diff --git a/megatron/core/ssm/gated_delta_net/gdn.py b/megatron/core/ssm/gated_delta_net/gdn.py
+index 65d9dc7..b98ae66 100644
+--- a/megatron/core/ssm/gated_delta_net/gdn.py
++++ b/megatron/core/ssm/gated_delta_net/gdn.py
+@@ -196,6 +196,23 @@ class GatedDeltaNet(_GDNBase):
+             if self.conv_bias
+             else None
+         )
++        # Hopper FLA tilelang varlen backward has produced NaNs with THD packing.
++        # Run dense (cu_seqlens=None) per pack segment instead; TE attn still uses THD.
++        pack_segments: list[tuple[int, int]] | None = None
++        if cu_seqlens_q is not None:
++            cu_list = [int(x) for x in cu_seqlens_q.tolist()]
++            pack_segments = [
++                (cu_list[i], cu_list[i + 1])
++                for i in range(len(cu_list) - 1)
++                if cu_list[i + 1] > cu_list[i]
++            ]
++            if not pack_segments:
++                raise ValueError(f"GDN packed cu_seqlens has no positive segments: {cu_list}")
++            # Logical cu may end before the physical tensor width (EOS pad-tail for TE).
++            # Cover the remainder with a dense segment so shapes stay [B, S, ...].
++            if pack_segments[-1][1] < seq_len:
++                pack_segments.append((pack_segments[-1][1], seq_len))
++
+         if self.config.deterministic_mode:
+             qkv = qkv.transpose(1, 2).contiguous()  # b, s, d -> b, d, s
+             conv_out = F.conv1d(
+@@ -211,15 +228,32 @@ class GatedDeltaNet(_GDNBase):
+             qkv = qkv.transpose(1, 2)  # b, d, s -> b, s, d
+         else:
+             assert self.activation in ["silu", "swish"]
+-            qkv, _ = causal_conv1d(
+-                x=qkv,  # FLA conv1d accepts [b, s, d] format input
+-                weight=conv1d_weight.squeeze(1),  # d, 1, w -> d, w
+-                bias=conv1d_bias,
+-                activation=self.activation,
+-                initial_state=None,
+-                output_final_state=False,
+-                cu_seqlens=cu_seqlens_q,
+-            )
++            if pack_segments is None:
++                qkv, _ = causal_conv1d(
++                    x=qkv,  # FLA conv1d accepts [b, s, d] format input
++                    weight=conv1d_weight.squeeze(1),  # d, 1, w -> d, w
++                    bias=conv1d_bias,
++                    activation=self.activation,
++                    initial_state=None,
++                    output_final_state=False,
++                    cu_seqlens=None,
++                )
++            else:
++                qkv = torch.cat(
++                    [
++                        causal_conv1d(
++                            x=qkv[:, s:e],
++                            weight=conv1d_weight.squeeze(1),
++                            bias=conv1d_bias,
++                            activation=self.activation,
++                            initial_state=None,
++                            output_final_state=False,
++                            cu_seqlens=None,
++                        )[0]
++                        for s, e in pack_segments
++                    ],
++                    dim=1,
++                )
+         nvtx_range_pop(suffix="conv1d")
+ 
+         A_log_local_cp = get_parameter_local_cp(self.A_log, dim=0, cp_group=self.pg_collection.cp)
+@@ -239,17 +273,37 @@ class GatedDeltaNet(_GDNBase):
+         nvtx_range_pop(suffix="g_and_beta")
+ 
+         nvtx_range_push(suffix="gated_delta_rule")
+-        core_attn_out, _ = self.gated_delta_rule(
+-            query,
+-            key,
+-            value,
+-            g=g,
+-            beta=beta,
+-            initial_state=None,
+-            output_final_state=False,
+-            use_qk_l2norm_in_kernel=False,
+-            cu_seqlens=cu_seqlens_q,
+-        )
++        if pack_segments is None:
++            core_attn_out, _ = self.gated_delta_rule(
++                query,
++                key,
++                value,
++                g=g,
++                beta=beta,
++                initial_state=None,
++                output_final_state=False,
++                use_qk_l2norm_in_kernel=False,
++                cu_seqlens=None,
++            )
++        else:
++            # query/key/value/g/beta are [B, S, ...] after prepare
++            core_attn_out = torch.cat(
++                [
++                    self.gated_delta_rule(
++                        query[:, s:e],
++                        key[:, s:e],
++                        value[:, s:e],
++                        g=g[:, s:e],
++                        beta=beta[:, s:e],
++                        initial_state=None,
++                        output_final_state=False,
++                        use_qk_l2norm_in_kernel=False,
++                        cu_seqlens=None,
++                    )[0]
++                    for s, e in pack_segments
++                ],
++                dim=1,
++            )
+         nvtx_range_pop(suffix="gated_delta_rule")
+ 
+         if self.recompute_norm_out:
+diff --git a/megatron/core/transformer/attention.py b/megatron/core/transformer/attention.py
+index 3a5876b..a71e1e8 100644
+--- a/megatron/core/transformer/attention.py
++++ b/megatron/core/transformer/attention.py
+@@ -1315,6 +1315,12 @@ class Attention(MegatronModule, ABC):
+             (Tuple[Tensor, Tensor]) Attention output and bias.
+ 
+         """
++        # Keep packed_seq_params for hybrid SSM/GDN; optionally force dense attention.
++        if packed_seq_params is not None and getattr(
++            self.config, "disable_thd_attention", False
++        ):
++            packed_seq_params = None
++
+         # Check if we need to skip RoPE
+         # no_rope is 0-indexed array and self.layer_number is 1-indexed
+         no_rope = (
+diff --git a/megatron/core/transformer/transformer_config.py b/megatron/core/transformer/transformer_config.py
+index 4f9de54..e141c04 100644
+--- a/megatron/core/transformer/transformer_config.py
++++ b/megatron/core/transformer/transformer_config.py
+@@ -271,6 +271,15 @@ class TransformerConfig(ModelParallelConfig):
+     attention_output_gate: bool = False
+     """Whether to apply output gate to the attention layers."""
+ 
++    disable_thd_attention: bool = False
++    """If True, SelfAttention ignores ``packed_seq_params`` (runs dense BSHD/SBHD).
++
++    Hybrid GDN/Mamba layers still receive packed metadata and can isolate pack
++    segments. Use this when TE/FA THD attention is numerically unstable with
++    offline packing (e.g. Qwen3.5 GDN+MoE), accepting possible cross-segment
++    attention leakage until THD is fixed.
++    """
++
+     test_mode: bool = False
+     """Whether to run real-time tests."""
+ 

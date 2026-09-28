@@ -1,0 +1,530 @@
+diff --git a/examples/conversion/adapter/export_adapter.py b/examples/conversion/adapter/export_adapter.py
+index 894ddc9..8f36037 100644
+--- a/examples/conversion/adapter/export_adapter.py
++++ b/examples/conversion/adapter/export_adapter.py
+@@ -121,6 +121,44 @@ def parse_args() -> argparse.Namespace:
+     return parser.parse_args()
+ 
+ 
++def _skip_lora_on_excluded_prefixes(lora: LoRA | VLMLoRA, prefixes: tuple[str, ...]) -> LoRA | VLMLoRA:
++    """Do not wrap modules matching exclude prefixes (same idea as training SkipMtpLoRA).
++
++    ``--exclude-adapter-base-prefix`` is only applied at HF save time. Dist checkpoint
++    load still requests every adapter the in-memory model has; if training skipped MTP
++    LoRA, those keys are absent and load raises KeyError.
++    """
++    if not prefixes:
++        return lora
++    orig_transform = lora.transform
++
++    def transform(module, name=None, prefix=None):
++        parts = [p for p in (prefix or "").split(".") if p]
++        if name:
++            parts.append(name)
++        path = ".".join(parts)
++        if any(excl in path for excl in prefixes):
++            return module
++        return orig_transform(module, name=name, prefix=prefix)
++
++    lora.transform = transform  # type: ignore[method-assign]
++    return lora
++
++
++def _drop_excluded_adapter_keys(state_dict: Mapping[str, object], prefixes: tuple[str, ...]) -> dict[str, object]:
++    """Drop adapter keys matching exclude prefixes before dist-checkpoint load."""
++    if not prefixes:
++        return dict(state_dict)
++    out: dict[str, object] = {}
++    for section, value in state_dict.items():
++        is_model = section == "model" or (section.startswith("model") and section[5:].isdigit())
++        if is_model and isinstance(value, dict):
++            out[section] = {k: v for k, v in value.items() if not any(excl in k for excl in prefixes)}
++        else:
++            out[section] = value
++    return out
++
++
+ def _load_lora_config(ckpt_path: Path) -> LoRA | VLMLoRA:
+     peft_class: type[LoRA | VLMLoRA] = LoRA
+     peft_cfg: dict = {}
+@@ -182,7 +220,8 @@ def _export_adapter_distributed(args: argparse.Namespace) -> None:
+         raise FileNotFoundError(f"PEFT checkpoint not found: {ckpt_path}")
+     config = AutoConfig.from_pretrained(args.hf_model_path, trust_remote_code=args.trust_remote_code)
+     bridge = AutoBridge.from_hf_config(config)
+-    lora = _load_lora_config(ckpt_path)
++    exclude_prefixes = tuple(args.exclude_adapter_base_prefix)
++    lora = _skip_lora_on_excluded_prefixes(_load_lora_config(ckpt_path), exclude_prefixes)
+ 
+     provider = bridge.to_megatron_provider(load_weights=False)
+     provider.tensor_model_parallel_size = args.tp
+@@ -192,6 +231,9 @@ def _export_adapter_distributed(args: argparse.Namespace) -> None:
+     provider.sequence_parallel = args.sequence_parallel
+     provider.pipeline_dtype = args.dtype
+     provider.params_dtype = args.dtype
++    # 本机 uv 环境无 APEX fused CUDA ext；Qwen3.5-VL 也与 TE fused RoPE 不兼容。
++    provider.gradient_accumulation_fusion = False
++    provider.apply_rope_fusion = False
+     provider.finalize()
+     provider.register_pre_wrap_hook(lambda chunks: lora(chunks, training=False))
+     try:
+@@ -211,12 +253,14 @@ def _export_adapter_distributed(args: argparse.Namespace) -> None:
+ 
+         sharded_state_dict = _generate_model_state_dict(model, {})
+         sharded_state_dict = apply_peft_adapter_filter_to_state_dict(sharded_state_dict, lora)
++        sharded_state_dict = _drop_excluded_adapter_keys(sharded_state_dict, exclude_prefixes)
+         legacy_shared_expert_adapter = enable_legacy_shared_expert_adapter_loading(
+             model, sharded_state_dict, ckpt_path
+         )
+         if legacy_shared_expert_adapter:
+             sharded_state_dict = _generate_model_state_dict(model, {})
+             sharded_state_dict = apply_peft_adapter_filter_to_state_dict(sharded_state_dict, lora)
++            sharded_state_dict = _drop_excluded_adapter_keys(sharded_state_dict, exclude_prefixes)
+         loaded_sd = dist_checkpointing.load(
+             sharded_state_dict,
+             str(ckpt_path),
+diff --git a/scripts/conversion/gpu_backend.py b/scripts/conversion/gpu_backend.py
+index 7a668cb..3781bfa 100644
+--- a/scripts/conversion/gpu_backend.py
++++ b/scripts/conversion/gpu_backend.py
+@@ -166,6 +166,8 @@ def _configure_model_provider(
+     model_provider.expert_tensor_parallel_size = etp
+     model_provider.pipeline_dtype = dtype
+     model_provider.params_dtype = dtype
++    # APEX fused_weight_gradient_mlp_cuda is not installed in the local uv env.
++    model_provider.gradient_accumulation_fusion = False
+ 
+ 
+ def _hf_tokenizer_kwargs(bridge: AutoBridge, *, trust_remote_code: bool) -> dict[str, object]:
+diff --git a/src/megatron/bridge/data/conversation_processing.py b/src/megatron/bridge/data/conversation_processing.py
+index 856781b..551bfba 100644
+--- a/src/megatron/bridge/data/conversation_processing.py
++++ b/src/megatron/bridge/data/conversation_processing.py
+@@ -1229,6 +1229,12 @@ def _assistant_mask_from_conversation_turns(
+             )
+         except (AssertionError, AttributeError, KeyError, TypeError, ValueError):
+             return None
++        except Exception as exc:
++            # Qwen chat template raises TemplateError on prefixes with no user query
++            # (e.g. system → assistant greeting). Skip that turn instead of aborting.
++            if type(exc).__name__ != "TemplateError":
++                raise
++            continue
+ 
+         turn_search_start = _common_token_prefix_length(before_ids, rendered_ids)
+         turn_limit = _common_token_prefix_length(through_ids, rendered_ids)
+diff --git a/src/megatron/bridge/data/packing/gpt_sft.py b/src/megatron/bridge/data/packing/gpt_sft.py
+index 8c39a84..99be3b5 100644
+--- a/src/megatron/bridge/data/packing/gpt_sft.py
++++ b/src/megatron/bridge/data/packing/gpt_sft.py
+@@ -236,10 +236,29 @@ class GPTSFTPackedDataset(GPTSFTDataset):
+                 if len(cu_seqlens_padded[-1]) > len(cu_seqlens[-1]):
+                     cu_seqlens[-1].append(cu_seqlens[-1][-1])
+             else:
+-                assert cu_seqlens[-1][-1] <= max_length
+-                # Prepadded data may leave padding at the end of the packed sequence.
+-                if cu_seqlens[-1][-1] != max_length:
+-                    cu_seqlens[-1].append(max_length)
++                # pad_seq_to_mult==1: keep logical cu at content; put EOS pad-tail only in
++                # cu_seqlens_padded. Folding pad-tail into logical makes GDN/FLA treat it as
++                # a real sequence and NaN on backward (hybrid Qwen3.5).
++                content_end = cu_seqlens[-1][-1]
++                assert content_end <= max_length
++                if content_end != max_length:
++                    if cu_seqlens_padded is None:
++                        cu_seqlens_padded = []
++                        for prev in cu_seqlens[:-1]:
++                            prev_list = list(prev)
++                            if prev_list[-1] < max_length:
++                                cup = list(prev_list)
++                                cup.append(max_length)
++                                cu_seqlens_padded.append(cup)
++                                prev.append(prev[-1])  # zero-length logical slot for pad-tail
++                            else:
++                                cu_seqlens_padded.append(prev_list)
++                    cup = list(cu_seqlens[-1])
++                    cup.append(max_length)
++                    cu_seqlens_padded.append(cup)
++                    cu_seqlens[-1].append(cu_seqlens[-1][-1])
++                elif cu_seqlens_padded is not None:
++                    cu_seqlens_padded.append(list(cu_seqlens[-1]))
+ 
+             if self.pad_cu_seqlens:
+                 # Pad both boundary representations to the same static shape with zero-length
+diff --git a/src/megatron/bridge/data/packing/offline.py b/src/megatron/bridge/data/packing/offline.py
+index 453926e..83bbbb4 100644
+--- a/src/megatron/bridge/data/packing/offline.py
++++ b/src/megatron/bridge/data/packing/offline.py
+@@ -46,6 +46,12 @@ def _init_shared_dataset_worker(dataset):
+ 
+ 
+ def _materialize_dataset_items(dataset, num_workers):
++    # Bridge default -1 historically meant "unset"; treat as auto (= CPU count).
++    # Values <= 1 remain serial.
++    if num_workers is None or num_workers < 0:
++        import os
++
++        num_workers = max(1, (os.cpu_count() or 8) // 2)
+     if num_workers <= 1:
+         return np.array([dataset[i] for i in tqdm(range(len(dataset)))])
+ 
+@@ -62,6 +68,7 @@ def _materialize_dataset_items(dataset, num_workers):
+     except (ValueError, OSError) as error:
+         logger.warning("Unable to raise the file-descriptor limit for tokenizer workers: %s", error)
+ 
++    logger.info("Materializing packed SFT samples with %d tokenizer workers", num_workers)
+     try:
+         with Pool(num_workers, initializer=_init_shared_dataset_worker, initargs=(dataset,)) as pool:
+             items = tqdm(pool.imap(_get_shared_dataset_item, range(len(dataset))), total=len(dataset))
+@@ -186,7 +193,7 @@ def tokenize_dataset(
+         path,
+         tokenizer=tokenizer,
+         seq_length=stored_max_seq_length,
+-        memmap_workers=2,
++        memmap_workers=max(2, num_tokenizer_workers if num_tokenizer_workers and num_tokenizer_workers > 1 else 8),
+         seed=seed,
+         packed_sequence_size=-1,
+         is_test=True,
+diff --git a/src/megatron/bridge/models/qwen_vl/modelling_qwen3_vl/model.py b/src/megatron/bridge/models/qwen_vl/modelling_qwen3_vl/model.py
+index aa1277a..774aae2 100644
+--- a/src/megatron/bridge/models/qwen_vl/modelling_qwen3_vl/model.py
++++ b/src/megatron/bridge/models/qwen_vl/modelling_qwen3_vl/model.py
+@@ -829,6 +829,11 @@ class Qwen3VLModel(MegatronModule):
+                     sequence_parallel=self.config.sequence_parallel,
+                 )
+ 
++        # Offline GPT SFT packing emits 1D/2D position_ids; Qwen3-VL MRoPE needs
++        # 3D ids rebuilt from input_ids (+ packed_seq_params). Drop incompatible ids.
++        if position_ids is not None and position_ids.dim() != 3:
++            position_ids = None
++
+         if position_ids is None:
+             if input_ids is None:
+                 raise ValueError(
+diff --git a/src/megatron/bridge/models/qwen_vl/modelling_qwen3_vl/rope.py b/src/megatron/bridge/models/qwen_vl/modelling_qwen3_vl/rope.py
+index 42495d1..d9c6a3d 100644
+--- a/src/megatron/bridge/models/qwen_vl/modelling_qwen3_vl/rope.py
++++ b/src/megatron/bridge/models/qwen_vl/modelling_qwen3_vl/rope.py
+@@ -41,24 +41,26 @@ def _get_flat_packed_ranges(
+         return None
+ 
+     cu_seqlens_unpadded, cu_seqlens_padded = get_packed_seq_q_cu_seqlens(packed_seq_params)
+-    if (
+-        cu_seqlens_padded is None
+-        or cu_seqlens_unpadded is None
+-        or cu_seqlens_padded.numel() < 3
+-        or cu_seqlens_unpadded.numel() < cu_seqlens_padded.numel()
+-    ):
++    if cu_seqlens_padded is None or cu_seqlens_unpadded is None or cu_seqlens_padded.numel() < 2:
+         return None
+ 
+     max_len = input_ids.size(1)
+     if int(cu_seqlens_padded[-1].item()) != max_len:
+         return None
+ 
++    # Logical cu may be shorter than padded when an EOS pad-tail exists only on
++    # the physical boundary array (after stripping zero-length logical slots).
++    n_pad = int(cu_seqlens_padded.numel()) - 1
++    n_logic = int(cu_seqlens_unpadded.numel()) - 1
+     ranges = []
+-    for idx in range(cu_seqlens_padded.numel() - 1):
++    for idx in range(n_pad):
+         padded_start = int(cu_seqlens_padded[idx].item())
+         padded_end = int(cu_seqlens_padded[idx + 1].item())
+-        unpadded_len = int((cu_seqlens_unpadded[idx + 1] - cu_seqlens_unpadded[idx]).item())
+-        valid_end = min(padded_start + unpadded_len, padded_end)
++        if idx < n_logic:
++            unpadded_len = int((cu_seqlens_unpadded[idx + 1] - cu_seqlens_unpadded[idx]).item())
++        else:
++            unpadded_len = 0
++        valid_end = min(padded_start + max(unpadded_len, 0), padded_end)
+         ranges.append((padded_start, valid_end, padded_end))
+     return ranges
+ 
+@@ -83,10 +85,23 @@ def get_packed_seq_attention_mask(input_ids: torch.Tensor, packed_seq_params: Pa
+     flat_packed_ranges = _get_flat_packed_ranges(input_ids, packed_seq_params)
+     if flat_packed_ranges is not None:
+         for padded_start, valid_end, _ in flat_packed_ranges:
+-            attention_mask[0, padded_start:valid_end] = True
++            if valid_end > padded_start:
++                attention_mask[0, padded_start:valid_end] = True
+         return attention_mask
+ 
+     if input_ids.dim() == 2 and input_ids.size(0) == 1 and seq_count > 1:
++        # Fall back to unpadded lengths along the flat stream when padded/logical
++        # metadata could not be paired (should be rare after pad-tail fixes).
++        if int(cu_seqlens_padded[-1].item()) == int(input_ids.size(1)):
++            for idx in range(seq_count):
++                s = int(cu_seqlens_padded[idx].item())
++                e = int(cu_seqlens_padded[idx + 1].item())
++                if idx + 1 < cu_seqlens_unpadded.numel():
++                    logical = int((cu_seqlens_unpadded[idx + 1] - cu_seqlens_unpadded[idx]).item())
++                    e = min(s + max(logical, 0), e)
++                if e > s:
++                    attention_mask[0, s:e] = True
++            return attention_mask
+         raise ValueError("Flat packed input length does not match its padded cu-seqlens metadata.")
+ 
+     for idx in range(min(input_ids.size(0), seq_count)):
+@@ -255,6 +270,12 @@ def _build_llm_rope_positions(
+     video_index: int,
+ ) -> tuple[torch.Tensor, int, int]:
+     """Build Qwen3-VL MRoPE positions for one logical sample."""
++    # pad_cu_seqlens 会留下 unpadded_len=0 的占位段；空样本不能走 torch.cat。
++    if sample_input_ids is None or sample_input_ids.numel() == 0:
++        device = sample_input_ids.device if isinstance(sample_input_ids, torch.Tensor) else "cpu"
++        dtype = sample_input_ids.dtype if isinstance(sample_input_ids, torch.Tensor) else torch.long
++        return torch.zeros(3, 0, dtype=dtype, device=device), image_index, video_index
++
+     vision_start_indices = torch.argwhere(sample_input_ids == vision_start_token_id).squeeze(1)
+     vision_tokens = sample_input_ids[vision_start_indices + 1]
+     image_nums = int((vision_tokens == image_token_id).sum().item())
+@@ -313,6 +334,13 @@ def _build_llm_rope_positions(
+         text_len = len(input_tokens) - st
+         llm_pos_ids_list.append(torch.arange(text_len).view(1, -1).expand(3, -1) + st_idx)
+ 
++    if not llm_pos_ids_list:
++        return (
++            torch.zeros(3, 0, dtype=sample_input_ids.dtype, device=sample_input_ids.device),
++            image_index,
++            video_index,
++        )
++
+     llm_positions = torch.cat(llm_pos_ids_list, dim=1).reshape(3, -1)
+     return llm_positions, image_index, video_index
+ 
+@@ -348,6 +376,10 @@ def get_rope_index(
+         image_index, video_index = 0, 0
+         mrope_position_deltas = []
+         for padded_start, valid_end, padded_end in flat_packed_ranges:
++            if valid_end <= padded_start:
++                # pad_cu_seqlens 占位段：无有效 token，跳过 MRoPE 构建
++                mrope_position_deltas.append(1 - (padded_end - padded_start))
++                continue
+             sample_input_ids = input_ids[0, padded_start:valid_end]
+             llm_positions, image_index, video_index = _build_llm_rope_positions(
+                 sample_input_ids,
+@@ -360,6 +392,9 @@ def get_rope_index(
+                 image_index=image_index,
+                 video_index=video_index,
+             )
++            if llm_positions.numel() == 0:
++                mrope_position_deltas.append(1 - (padded_end - padded_start))
++                continue
+             position_ids[..., 0, padded_start:valid_end] = llm_positions.to(position_ids.device)
+             mrope_position_deltas.append(llm_positions.max() + 1 - (padded_end - padded_start))
+         mrope_position_deltas = torch.tensor(mrope_position_deltas, device=input_ids.device).unsqueeze(1)
+diff --git a/src/megatron/bridge/training/gpt_step.py b/src/megatron/bridge/training/gpt_step.py
+index 5d1d42d..b8fa380 100644
+--- a/src/megatron/bridge/training/gpt_step.py
++++ b/src/megatron/bridge/training/gpt_step.py
+@@ -41,7 +41,11 @@ from megatron.bridge.training.losses import masked_next_token_loss
+ from megatron.bridge.training.post_training.distillation import loss_func_kd
+ from megatron.bridge.training.state import GlobalState
+ from megatron.bridge.training.utils.flop_utils import accumulate_flops_metadata, get_model_chunk_vp_stage
+-from megatron.bridge.training.utils.packed_seq_utils import get_packed_seq_params, get_thd_cp_partition_indices
++from megatron.bridge.training.utils.packed_seq_utils import (
++    get_packed_seq_params,
++    get_thd_cp_partition_indices,
++    trim_pack_eos_pad_tail,
++)
+ from megatron.bridge.training.utils.pg_utils import get_pg_collection
+ 
+ 
+@@ -392,6 +396,20 @@ def _forward_step_common(
+         )
+     timers("batch-generator").stop()
+ 
++    # Drop offline-pack EOS pad-tail (logical cu < padded width) before FLOPs/model.
++    # Hybrid GDN/FLA NaNs if that pad-tail is a real THD segment.
++    if packed_seq_metadata is not None:
++        (
++            tokens,
++            labels,
++            loss_mask,
++            position_ids,
++            packed_seq_metadata,
++            attention_mask,
++        ) = trim_pack_eos_pad_tail(
++            tokens, labels, loss_mask, position_ids, packed_seq_metadata, attention_mask
++        )
++
+     # Accumulate FLOPS metadata across micro-batches. The THD attention term Σᵢ sᵢ² is
+     # derived inline from cu_seqlens (kept on-device, sync-free); see
+     # accumulate_flops_metadata. Falls back to BSHD when cu_seqlens is absent.
+@@ -402,7 +420,12 @@ def _forward_step_common(
+     # follow-up tracked in #4161. Until then, forward cu_seqlens only for CP == 1 so
+     # CP > 1 stays on the BSHD term (the behavior this test passed on before the THD
+     # change), instead of running the not-yet-CP-safe cu_seqlens path.
+-    cp_use_thd = pg_collection.cp.size() == 1
++    # THD FLOP term (Σ sᵢ²) only when attention actually runs THD. If
++    # disable_thd_attention is set, attention is dense S² — report BSHD FLOPs.
++    cp_use_thd = (
++        pg_collection.cp.size() == 1
++        and not getattr(config, "disable_thd_attention", False)
++    )
+     cu_seqlens = None
+     cu_seqlens_argmin = None
+     cu_seqlens_unpadded = None
+@@ -436,8 +459,14 @@ def _forward_step_common(
+         "labels": labels,
+     }
+ 
+-    # Add packed sequence support
+-    if packed_seq_metadata is not None:
++    # Add packed sequence support.
++    # When disable_thd_attention is set (Qwen3.5 packing default), drop ALL
++    # packed_seq_params: TE/FA THD and GDN varlen/segment paths have both
++    # produced NaNs. Keep packed *data* (denser labels) + pad-tail zeroed in
++    # loss_mask; model runs dense BSHD over the full schedule width.
++    if packed_seq_metadata is not None and not getattr(
++        config, "disable_thd_attention", False
++    ):
+         # total_tokens drives seq_idx computation in PackedSeqParams.__post_init__,
+         # which is only needed for Mamba/hybrid SSM layers. Skip it for pure
+         # transformer models to avoid per-step CUDA overhead.
+diff --git a/src/megatron/bridge/training/utils/packed_seq_utils.py b/src/megatron/bridge/training/utils/packed_seq_utils.py
+index acea8a3..cda695c 100644
+--- a/src/megatron/bridge/training/utils/packed_seq_utils.py
++++ b/src/megatron/bridge/training/utils/packed_seq_utils.py
+@@ -244,6 +244,114 @@ def _as_python_int(value: PackedMetadataValue, *, field_name: str) -> int | None
+     return int(value)
+ 
+ 
++def _strip_empty_suffix(cu_seqlens: torch.Tensor) -> torch.Tensor:
++    """Drop trailing zero-length slots (repeated cumulative boundaries)."""
++    cu = cu_seqlens.view(-1)
++    end = cu.numel()
++    while end > 1 and int(cu[end - 1].item()) == int(cu[end - 2].item()):
++        end -= 1
++    if end == cu.numel():
++        return cu_seqlens if cu_seqlens.dim() == 1 else cu
++    return cu[:end].contiguous()
++
++
++def _strip_trailing_empty_cu_seqlens(
++    cu_seqlens: torch.Tensor | None,
++    cu_seqlens_padded: torch.Tensor | None,
++) -> tuple[torch.Tensor | None, torch.Tensor | None]:
++    """Drop trailing zero-length pack slots introduced by ``pad_cu_seqlens``.
++
++    Logical and padded are stripped independently so a physical EOS pad-tail
++    (logical zero-length slot + padded max_length) is not accidentally removed
++    from ``cu_seqlens_padded``.
++    """
++    if cu_seqlens is not None and isinstance(cu_seqlens, torch.Tensor) and cu_seqlens.numel() >= 2:
++        cu_seqlens = _strip_empty_suffix(cu_seqlens)
++    if (
++        cu_seqlens_padded is not None
++        and isinstance(cu_seqlens_padded, torch.Tensor)
++        and cu_seqlens_padded.numel() >= 2
++    ):
++        cu_seqlens_padded = _strip_empty_suffix(cu_seqlens_padded)
++    return cu_seqlens, cu_seqlens_padded
++
++
++def trim_pack_eos_pad_tail(
++    tokens: torch.Tensor | None,
++    labels: torch.Tensor | None,
++    loss_mask: torch.Tensor | None,
++    position_ids: torch.Tensor | None,
++    packed_seq_metadata: dict[str, PackedMetadataValue] | None,
++    attention_mask: torch.Tensor | None = None,
++) -> tuple[
++    torch.Tensor | None,
++    torch.Tensor | None,
++    torch.Tensor | None,
++    torch.Tensor | None,
++    dict[str, PackedMetadataValue] | None,
++    torch.Tensor | None,
++]:
++    """Truncate microbatch tensors to logical pack length (drop EOS pad-tail).
++
++    Offline packed SFT with ``pad_to_max_length`` appends an EOS pad-tail so the
++    tensor width is ``max_seq_length``. That pad-tail must not be fed to hybrid
++    GDN/FLA as a real THD sequence. When logical/padded cu_seqlens are present,
++    keep logical boundaries and slice tokens to ``cu_logical[-1]``.
++    """
++    if packed_seq_metadata is None or tokens is None:
++        return tokens, labels, loss_mask, position_ids, packed_seq_metadata, attention_mask
++
++    cu = packed_seq_metadata.get("cu_seqlens_q")
++    cup = packed_seq_metadata.get("cu_seqlens_q_padded")
++    if cu is None or not isinstance(cu, torch.Tensor):
++        return tokens, labels, loss_mask, position_ids, packed_seq_metadata, attention_mask
++
++    cu, cup = _strip_trailing_empty_cu_seqlens(cu, cup if isinstance(cup, torch.Tensor) else None)
++    # If padded is longer than logical, logical is the true content end.
++    work_len = int(cu.view(-1)[-1].item())
++    if cup is not None:
++        pad_end = int(cup.view(-1)[-1].item())
++        if pad_end < work_len:
++            raise ValueError(
++                f"Packed cu_seqlens_padded[-1]={pad_end} < cu_seqlens_q[-1]={work_len}"
++            )
++    seq_dim_len = tokens.size(1)
++    # Keep fixed tensor width (= schedule seq_length from batch sampler).
++    if loss_mask is not None and 0 < work_len < seq_dim_len:
++        loss_mask = loss_mask.clone()
++        loss_mask[:, work_len:] = 0
++
++    packed_seq_metadata = dict(packed_seq_metadata)
++    packed_seq_metadata["cu_seqlens_q"] = cu
++    packed_seq_metadata["cu_seqlens_kv"] = cu
++    if cup is None and work_len < seq_dim_len:
++        cup = torch.cat([cu.view(-1), cu.new_tensor([seq_dim_len])])
++        cu = torch.cat([cu.view(-1), cu.view(-1)[-1:]])
++        packed_seq_metadata["cu_seqlens_q"] = cu
++        packed_seq_metadata["cu_seqlens_kv"] = cu
++    if cup is not None:
++        cup = cup.view(-1).clone()
++        if int(cup[-1].item()) != seq_dim_len:
++            if int(cup[-1].item()) < seq_dim_len:
++                cup = torch.cat([cup, cup.new_tensor([seq_dim_len])])
++            else:
++                cup[-1] = seq_dim_len
++        packed_seq_metadata["cu_seqlens_q_padded"] = cup
++        packed_seq_metadata["cu_seqlens_kv_padded"] = cup
++    cu2, cup2 = _strip_trailing_empty_cu_seqlens(
++        packed_seq_metadata["cu_seqlens_q"],
++        packed_seq_metadata.get("cu_seqlens_q_padded")
++        if isinstance(packed_seq_metadata.get("cu_seqlens_q_padded"), torch.Tensor)
++        else None,
++    )
++    packed_seq_metadata["cu_seqlens_q"] = cu2
++    packed_seq_metadata["cu_seqlens_kv"] = cu2
++    if cup2 is not None:
++        packed_seq_metadata["cu_seqlens_q_padded"] = cup2
++        packed_seq_metadata["cu_seqlens_kv_padded"] = cup2
++    return tokens, labels, loss_mask, position_ids, packed_seq_metadata, attention_mask
++
++
+ def get_packed_seq_params(batch: dict[str, PackedMetadataValue]) -> PackedSeqParams:
+     """Build packed sequence parameters from a batch dictionary.
+ 
+@@ -266,13 +374,24 @@ def get_packed_seq_params(batch: dict[str, PackedMetadataValue]) -> PackedSeqPar
+     if "cu_seqlens_q" in batch:
+         cu_seqlens_q = _squeeze_metadata(batch["cu_seqlens_q"])
+         cu_seqlens_kv = _squeeze_metadata(batch.get("cu_seqlens_kv"))
++        cu_seqlens_q_padded = _squeeze_metadata(batch.get("cu_seqlens_q_padded"))
++        cu_seqlens_kv_padded = _squeeze_metadata(batch.get("cu_seqlens_kv_padded"))
++        # pad_cu_seqlens 会在尾部塞零长段（同值重复）。GDN/FLA/causal_conv1d
++        # 对零长序列反传易出 NaN，喂进 kernel 前裁掉。
++        cu_seqlens_q, cu_seqlens_q_padded = _strip_trailing_empty_cu_seqlens(
++            cu_seqlens_q, cu_seqlens_q_padded
++        )
++        if cu_seqlens_kv is not None:
++            cu_seqlens_kv, cu_seqlens_kv_padded = _strip_trailing_empty_cu_seqlens(
++                cu_seqlens_kv, cu_seqlens_kv_padded
++            )
+         max_seqlen_q = _as_python_int(batch.get("max_seqlen_q"), field_name="max_seqlen_q")
+         max_seqlen_kv = _as_python_int(batch.get("max_seqlen_kv"), field_name="max_seqlen_kv")
+         return PackedSeqParams(
+             cu_seqlens_q=cu_seqlens_q,
+             cu_seqlens_kv=cu_seqlens_kv if cu_seqlens_kv is not None else cu_seqlens_q,
+-            cu_seqlens_q_padded=_squeeze_metadata(batch.get("cu_seqlens_q_padded")),
+-            cu_seqlens_kv_padded=_squeeze_metadata(batch.get("cu_seqlens_kv_padded")),
++            cu_seqlens_q_padded=cu_seqlens_q_padded,
++            cu_seqlens_kv_padded=cu_seqlens_kv_padded if cu_seqlens_kv_padded is not None else cu_seqlens_q_padded,
+             max_seqlen_q=max_seqlen_q,
+             max_seqlen_kv=max_seqlen_kv if max_seqlen_kv is not None else max_seqlen_q,
+             total_tokens=batch.get("total_tokens"),

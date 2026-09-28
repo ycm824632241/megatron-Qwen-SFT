@@ -1,0 +1,26 @@
+{
+  "out": "/kwkj-k8s/llm_team/ycm/megatron_qwen35/qwen35_lora/data/synthlong_raw.jsonl",
+  "kept": 56338,
+  "bad": 0,
+  "excluded": [
+    "train_convqa_raft_syntactic.jsonl"
+  ],
+  "per_file": {
+    "train_rag_tge_raft.jsonl": {
+      "kept": 8348,
+      "bad": 0
+    },
+    "train_rag_tge_raft_zh.jsonl": {
+      "kept": 8348,
+      "bad": 0
+    },
+    "train_narrativeqa_aug_32k.jsonl": {
+      "kept": 953,
+      "bad": 0
+    },
+    "train_convqa_raft.jsonl": {
+      "kept": 38689,
+      "bad": 0
+    }
+  }
+}
